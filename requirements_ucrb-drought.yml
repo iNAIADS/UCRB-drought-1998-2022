@@ -1,0 +1,31 @@
+name: ucrb-drought
+channels:
+  - conda-forge
+dependencies:
+  - python=3.9
+  - numpy=1.22.3
+  - pandas=1.4.3
+  - glob2=0.7
+  - matplotlib=3.5.1
+  - seaborn=0.11.2
+  - cartopy=0.20.1
+  - pymannkendall=1.4.1
+  - scipy=1.8.0
+  - scikit-learn=1.2.2
+  - shap=0.42.1
+  - earthengine-api=0.1.417
+  - geopandas=0.10.2
+  - h5py>=3.1.0
+  - pytables
+  - pathlib
+  - jupyterlab>=3.0.8
+  - xgboost=1.7.6
+  - ipykernel
+  - pip
+  - pip:
+    - -e ./pyeto  # Install local pyeto package in editable mode
+    - -e ./preprocessing 
+    - -e ./calculations 
+    - -e ./feature_importance  
+
+

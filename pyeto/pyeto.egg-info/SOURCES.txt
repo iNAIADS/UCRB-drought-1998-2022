@@ -1,0 +1,5 @@
+setup.py
+pyeto.egg-info/PKG-INFO
+pyeto.egg-info/SOURCES.txt
+pyeto.egg-info/dependency_links.txt
+pyeto.egg-info/top_level.txt
