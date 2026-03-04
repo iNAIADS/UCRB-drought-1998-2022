@@ -121,44 +121,6 @@ def convert_to_water_years(dataset):
     dataset_wyear.drop(columns=['year'], inplace=True)
     return dataset_wyear
 
-def convert_to_calendar_years(dataset):
-    """
-    Convert a pandas DataFrame with a MultiIndex ['wyear', 'month', 'day'] or ['wyear', 'month']
-    to a DataFrame with a MultiIndex ['year', 'month', 'day'] or ['year', 'month'].
-
-    Parameters:
-    dataset (pd.DataFrame): Input DataFrame with a MultiIndex ['wyear', 'month', 'day'] or ['wyear', 'month'].
-
-    Returns:
-    pd.DataFrame: DataFrame with a MultiIndex ['year', 'month', 'day'] or ['year', 'month'].
-    """
-    # Check if the index is a MultiIndex
-    if not isinstance(dataset.index, pd.MultiIndex):
-        print('Dataset given does not have a MultiIndex. Cannot convert.')
-        return None
-
-    # Check if the index names are either ['wyear', 'month', 'day'] or ['wyear', 'month']
-    index_names = dataset.index.names
-    if index_names not in [('wyear', 'month', 'day'), ('wyear', 'month')]:
-        print('Dataset given does not have proper index (wyear, month, day OR wyear, month). Cannot convert.')
-        return None
-
-    # Reset index to work with columns
-    dataset_reset = dataset.reset_index()
-
-    # Calculate calendar year using vectorized operations
-    # If month >= 10, calendar year = wyear - 1, else calendar year = wyear
-    dataset_reset['year'] = dataset_reset['wyear'] - (dataset_reset['month'] >= 10).astype(int)
-
-    # Set the new MultiIndex
-    if index_names == ('wyear', 'month', 'day'):
-        dataset_year = dataset_reset.set_index(['year', 'month', 'day'])
-    else:
-        dataset_year = dataset_reset.set_index(['year', 'month'])
-
-    # Drop the original 'wyear' column
-    dataset_year.drop(columns=['wyear'], inplace=True)
-    return dataset_year
 
 
 def combine_augmentedWT(data_wyear, augmentedWT_data, RMSE_WT_data):
