@@ -9,300 +9,18 @@ import pymannkendall as mk
 from datetime import date, timedelta
 import numpy as np
 import warnings
-import pyeto
 import seaborn as sns
+import matplotlib as mpl
 import matplotlib.pyplot as plt
+from matplotlib import pyplot as plt, ticker as mticker
+from matplotlib.ticker import FormatStrFormatter
 import preprocessing
 
 var_names = ['RDC','WT','SC']
 MET_vars = ['precip','temp']
-
-
-def calculate_pet(tmean, gages_latitudes, output_dir=None, stop_year=2023):
-    """
-    Calculate Potential Evapotranspiration (PET) using the Thornthwaite method.
+all_variables = var_names + MET_vars
+all_vars_qp   = var_names + MET_vars + ['runoff_efficiency', 'reservoirs']
     
-    Parameters:
-    tmean (pd.DataFrame): Temperature DataFrame with MultiIndex ['year','month'] and site IDs as columns
-    gages_latitudes (pd.DataFrame): DataFrame with site IDs as index and latitude information
-    output_dir (str, optional): Directory to save the output CSV file. If None, file is not saved.
-    stop_year (int, optional): Year to stop calculations at (inclusive). Defaults to 2023.
-    
-    Returns:
-    pd.DataFrame: PET data with MultiIndex ['year','month'] and site IDs as columns
-    """
-    # Convert column names to integers for consistent comparison
-    tmean_df = tmean.copy()
-    tmean_df.columns = tmean_df.columns.astype(int)
-    tmean_df = tmean_df[tmean_df.index.get_level_values('year') != stop_year+1]
-    
-    # Find sites that exist in both temperature data and gages data
-    met_sites = set(tmean_df.columns)
-    gage_sites = set(gages_latitudes.index.values)
-    common_sites = list(met_sites.intersection(gage_sites))
-    
-    if not common_sites:
-        raise ValueError("No common sites found between temperature data and gages data")
-    
-    # Report sites that are in temperature data but not in gages data
-    missing_sites = met_sites - set(common_sites)
-    if missing_sites:
-        print(f'MET sites not in GAGESII: {missing_sites}')
-    
-    # Extract relevant latitude data
-    site_latitudes = gages_latitudes.loc[common_sites, 'LAT_GAGE'].to_dict()
-    
-    # Initialize PET DataFrame with same structure as temperature data
-    pet_data = pd.DataFrame(index=tmean_df.index, columns=common_sites)
-    
-    # Get unique years from the index, limited by stop_year
-    years = [year for year in tmean_df.index.get_level_values(0).unique() if year <= stop_year]
-    
-    # Calculate PET for each site
-    for site in common_sites:
-        # Convert latitude to radians
-        latitude_rad = pyeto.deg2rad(site_latitudes[site])
-        
-        for year in years:
-            try:
-                # Get temperature data for the current year and site
-                temps = tmean_df.xs(year, level=0)[site].values
-                
-                # Calculate daylight hours
-                daylight_hours = pyeto.monthly_mean_daylight_hours(latitude_rad, year)
-                
-                # Calculate PET values
-                pet_values = pyeto.thornthwaite(temps, daylight_hours, year)
-                
-                # Assign PET values to the DataFrame
-                for month, pet_value in enumerate(pet_values, 1):
-                    pet_data.loc[(year, month), site] = pet_value
-                    
-            except Exception as e:
-                print(f"Error calculating PET for site {site}, year {year}: {e}")
-                # Fill with NaN for this year
-                for month in range(1, 13):
-                    pet_data.loc[(year, month), site] = np.nan
-    
-    # Ensure column names are integers
-    pet_data.columns = pet_data.columns.astype(int)
-    print('PET calculation completed.')
-    
-    # Save to file if output directory is provided
-    if output_dir is not None:
-        output_path = os.path.join(output_dir, 'pet_calc_thorn.csv')
-        pet_data.to_csv(output_path)
-        print(f'PET data saved to {output_path}')
-    return pet_data
-
-
-# calculate basin avg
-def basin_averaging(variable, gagesii_int):
-    '''
-    Add a column for the basin averaged version (divide by basin area)
-    sites are in columns, dates in index (monthly)
-
-    Parameters:
-    variable: dataframe with the observations for a varaiable with catchments as columns and dates as index
-    gagesii_int: GAGESII traits to grab basin area
-    
-    Returns dataframe with column for basin average
-    '''
-    variable_wAVG = variable.copy()
-    variable_wAVG['BASIN_AVG'] = 0
-    gage_sizes = gagesii_int[['DRAIN_SQKM']].transpose()
-    total_weights = gage_sizes.sum(axis=1).values[0]
-
-    numerator = 0
-    denominator = total_weights
-    for index in range(0,len(variable.index)):
-        month_values = variable.iloc[index]
-        for site in variable.columns:
-            numerator += month_values[site]*gage_sizes[site]
-        variable_wAVG.iat[index,len(variable_wAVG.columns)-1] = numerator / denominator
-        numerator = 0
-    return variable_wAVG
-
-# calculate SPEI
-# Reference: https://spei.csic.es/home.html#p7
-def calc_SPEI(gagesii_data, precipitation, pet, output_dir=None, start_year=1998, end_year=2022):
-    """
-    Calculate Standardized Precipitation Evapotranspiration Index (SPEI) for multiple basins.
-    
-    Parameters:
-    gagesii_data (pd.DataFrame): DataFrame containing basin metadata including 'DRAIN_SQKM'
-    precipitation (pd.DataFrame): DataFrame containing precipitation data with MultiIndex (year, month)
-    pet (pd.DataFrame): DataFrame containing potential evapotranspiration data with MultiIndex (year, month)
-    output_dir (str, optional): Directory to save output files. If None, files are not saved.
-    start_year (int): Start year for truncated SPEI calculation (default: 1998)
-    end_year (int): End year for truncated SPEI calculation (default: 2022)
-    
-    Returns:
-    tuple: (annual SPEI values, truncated annual SPEI values), both pandas dataframes
-    """
-    print("Calculating SPEI (Standardized Precipitation Evapotranspiration Index)...")
-    
-    # Calculate basin-averaged precipitation and PET
-    precip_basin_avg = basin_averaging(precipitation, gagesii_data)
-    pet_basin_avg = basin_averaging(pet, gagesii_data)
-    
-    # Step 1: Calculate water deficit (D = P - PET)
-    water_deficit = precip_basin_avg - pet_basin_avg
-    print(f"Calculated water deficit (P - PET) for {len(water_deficit.columns)} basins")
-    
-    # Step 2: Calculate 12-month rolling mean of water deficit
-    deficit_rolling_mean = pd.DataFrame()
-    
-    for basin in water_deficit.columns:
-        basin_rolling = water_deficit[basin].rolling(12, center=True).mean().dropna()
-        deficit_rolling_mean[basin] = basin_rolling
-    
-    print(f"Calculated 12-month rolling mean of water deficit")
-    
-    # Step 3: Calculate SPEI for each basin using Gringorten plotting position
-    all_basin_spei = []
-    
-    for basin in deficit_rolling_mean.columns:
-        # Sort values for ranking
-        basin_data = deficit_rolling_mean[basin].to_frame()
-        basin_ranked = basin_data.sort_values(by=basin, ascending=True).reset_index()
-        basin_ranked.index = basin_ranked.index + 1  # Start index at 1
-        
-        # Calculate Gringorten plotting position
-        n_observations = len(basin_ranked)
-        basin_ranked['gringorten'] = [(i - 0.44) / (n_observations + 0.12) for i in basin_ranked.index]
-        
-        # Restore date index and sort chronologically
-        basin_date_sorted = basin_ranked.set_index(['year', 'month']).sort_index(level=[0, 1])
-        
-        # Calculate SPEI (standardized Gringorten values)
-        gringorten_values = basin_date_sorted['gringorten']
-        basin_date_sorted['SPEI'] = ((gringorten_values - gringorten_values.mean()) / 
-                                     gringorten_values.std())
-        
-        # Prepare for concatenation
-        basin_spei = basin_date_sorted[['SPEI']].rename(columns={'SPEI': basin})
-        all_basin_spei.append(basin_spei)
-    
-    # Combine all basin SPEI values
-    combined_spei = pd.concat(all_basin_spei, axis=1)
-    print(f"Calculated SPEI for {len(combined_spei.columns)} basins")
-    
-    # Convert to water years
-    spei_water_years = preprocessing.convert_to_water_years(combined_spei)
-    spei_water_years.reset_index(inplace=True)
-    
-    # Create truncated version for specified period
-    truncated_spei = spei_water_years.loc[
-        (spei_water_years['wyear'] >= start_year) & 
-        (spei_water_years['wyear'] <= end_year)
-    ]
-    
-    # Set MultiIndex for both DataFrames
-    spei_water_years.set_index(['wyear', 'month'], inplace=True)
-    truncated_spei.set_index(['wyear', 'month'], inplace=True)
-    
-    # Calculate annual averages
-    annual_spei = spei_water_years.groupby(level=0).mean()
-    truncated_annual_spei = truncated_spei.groupby(level=0).mean()
-    
-    print(f"Calculated annual SPEI values for water years {annual_spei.index.min()} to {annual_spei.index.max()}")
-    print(f"Truncated annual SPEI covers water years {start_year} to {end_year}")
-    
-    # Save results if output directory is provided
-    if output_dir is not None:
-        # Save annual SPEI values
-        annual_file = os.path.join(output_dir, 'ann_spei_wy.csv')
-        annual_spei.to_csv(annual_file)
-        
-        # Save truncated annual SPEI values
-        truncated_file = os.path.join(output_dir, 'TRUN_ann_spei_wy.csv')
-        truncated_annual_spei.to_csv(truncated_file)
-        print(f"SPEI data saved to {output_dir}")
-    return annual_spei, truncated_annual_spei
-
-    
-# plotting SPEI
-def plotting_spei(ann_spei_wy, gagesii_int, RDC_all3_allsites, spei_cmap, figure_dir=None,OPTION=False):
-    '''
-    Plot the SPEI for given sites in elevation order and get table of SPEI values
-    OPTION: save spei table with elevations
-
-    Parameters:
-    ann_spei_wy: pandas dataframe with SPEI values for sites as columns, years as index
-    gagesii_int: GAGESII data
-    RDC_all3_allsites: list of sites to use for SPEI (streamflow sites that match data criteria and are present in analysis)
-    spei_cmap: colormap for plotting
-    figure_dir: directory to save the figure
-    OPTION: save spei table with elevations 
-
-    Returns: plot and optional table
-    '''
-    ##### add a bunch of columns to make basin avg wider
-    ann_spei = ann_spei_wy.copy()
-    ann_spei['Basin Average'] = ann_spei['BASIN_AVG']
-    ann_spei['BASIN_AVG'] = np.nan
-    ann_spei['Basin Avg'] = ann_spei['Basin Average']
-    ann_spei['BASIN Avg'] = ann_spei['Basin Average']
-    ann_spei['Basin AVG'] = ann_spei['Basin Average']
-    
-    #### Sort sites in by DESCENDING MEAN ELEVATION AND only grab  sites
-    gages_elevation = gagesii_int[['ELEV_MEAN_M_BASIN']]
-    total_size_all3 = len(RDC_all3_allsites) # flow sites
-    size_plus5_all3 = total_size_all3+5
-    gages_sort_elev_all3 = gages_elevation.transpose()[RDC_all3_allsites].sort_values(by='ELEV_MEAN_M_BASIN',axis=1,ascending=False)
-    sorted_sites_all3 = np.concatenate((gages_sort_elev_all3.columns.values.reshape((1,total_size_all3)),ann_spei.columns[-5:].values.reshape((1,5))),axis=1)
-    sorted_sites_2_all3 = sorted_sites_all3.reshape((size_plus5_all3,))
-    sorted_sites_2_all3 = list(map(str, sorted_sites_2_all3))
-    ann_spei_2plot = ann_spei[sorted_sites_2_all3]
-
-    ## PLOT: SPEI figure
-    fig, ax = plt.subplots(figsize=(45,10))
-    fsize=12
-    data = ann_spei_2plot
-
-    # Add title to the Heat map
-    title = f'SPEI Heat Map Descending Elevation (Water Years, n={len(RDC_all3_allsites)})'
-
-    # Set the font size and the distance of the title from the plot
-    plt.title(title,fontsize=20)
-    ttl = ax.title
-    ttl.set_position([0.5,1.05])
-
-    # Use the heatmap function from the seaborn package
-    sns.heatmap(data,annot=False,annot_kws={"size": 10}, fmt=".1f",cmap=spei_cmap,vmin=-1.5,vmax=1.5,center=0,ax=ax)
-    for t in ax.texts:
-        if -0.5 <= float(t.get_text()) <=0.5:
-            t.set_text(t.get_text())  
-        else:
-            t.set_text('') # if not it sets an empty text
-
-    ax.set_ylabel('',fontsize=1)
-    for label in (ax.get_yticklabels()):
-        label.set_fontsize(16)
-
-    ax.xaxis.set_major_locator(plt.MaxNLocator(204))
-    for label in (ax.get_xticklabels()):
-        label.set_fontsize(0)
-
-    # use matplotlib.colorbar.Colorbar object
-    cbar = ax.collections[0].colorbar
-    cbar.ax.tick_params(labelsize=16)
-
-    fig.tight_layout()
-    if figure_dir != None:
-        plt.savefig(figure_dir+'/ALL3_SPEI_wy_elevation_VARSITES_wlabels.svg',dpi=300)
-    plt.show()
-
-    if OPTION:
-        ## Add elevation to the SPEI table to save
-        gages_sort_elev_all3['Basin Average'] = gages_sort_elev_all3.loc['ELEV_MEAN_M_BASIN'].mean()
-        spei_2save = ann_spei_2plot.copy().transpose()
-        spei_2save['Elevation'] = gages_sort_elev_all3.transpose()['ELEV_MEAN_M_BASIN']
-        spei_2save.to_csv(figure_dir+'spei_ann_wyElevation.csv')
-        print('SPEI and elevation dataframe saved: '+figure_dir+'spei_ann_wyElevation.csv')
-    return
-
 
 # identify drought and reference years
 def identify_years(annual_spei_data, drought_threshold=-1, reference_threshold=1, 
@@ -410,6 +128,110 @@ def identify_years(annual_spei_data, drought_threshold=-1, reference_threshold=1
         all_years_by_event.append(all_years)
     return drought_years, drought_events, drought_years_by_event, reference_years_by_event, all_years_by_event
 
+
+def build_drought_site_dicts(dr_names, list_all_years, list_ref_years, list_dr_years,
+                              var_names, list_all_data, avail):
+    """
+    Build dictionaries organizing data by drought episode, variable, and year type.
+
+    Parameters:
+    dr_names (list): List of drought episode names e.g. ['2001_2002', '2012', '2018', '2020_2021']
+    list_all_years (list): List of year lists for each drought episode (drought + reference years)
+    list_ref_years (list): List of reference year lists for each drought episode
+    list_dr_years (list): List of drought year lists for each drought episode
+    var_names (list): List of variable names e.g. ['RDC', 'WT', 'SC']
+    list_all_data (list): List of DataFrames corresponding to each variable in var_names
+    avail (dict): Availability DataFrames keyed by variable name
+
+    Returns:
+    dr_all3, ref_all3, dr_years_list, sites_all3, refyrs_all3, dryrs_all3
+    """
+    # Drought episode year lists 
+    dr_all3 = {}
+    ref_all3 = {}
+    dr_years_list = {}
+
+    for number, drought in enumerate(dr_names):
+        dr_all3[drought] = list_all_years[number]
+        ref_all3[drought] = list_ref_years[number]
+        dr_years_list[drought] = list_dr_years[number]
+
+    # Sites with data for each drought episode 
+    sites_all3 = {var: {} for var in var_names}
+
+    for num, var in enumerate(var_names):
+        for drought in dr_names:
+            sites_all3[var][drought] = list_all_data[num].copy()
+
+            for site in avail[var].columns:
+                for year in dr_all3[drought]:
+                    if avail[var].at[year, site] == 0:
+                        if site in sites_all3[var][drought].columns.values:
+                            sites_all3[var][drought].drop(site, axis=1, inplace=True)
+
+    # Reference year slices
+    refyrs_all3 = {var: {} for var in var_names}
+
+    for dr in dr_names:
+        for var in var_names:
+            refyrs_all3[var][dr] = sites_all3[var][dr].transpose()[ref_all3[dr]].transpose()
+
+    # Drought year slices 
+    dryrs_all3 = {var: {} for var in var_names}
+
+    dr_names_1yr = ['2012', '2018']
+    for dr in dr_names_1yr:
+        for var in var_names:
+            dryrs_all3[var][dr] = sites_all3[var][dr].transpose()[int(dr)].transpose()
+
+    for var in var_names:
+        dryrs_all3[var]['2001_2002'] = sites_all3[var]['2001_2002'].transpose()[[2001, 2002]].transpose()
+        dryrs_all3[var]['2020_2021'] = sites_all3[var]['2020_2021'].transpose()[[2020, 2021]].transpose()
+
+    print("------ created framework of dictionaries for drought, reference, and all years ------")
+
+    return dr_all3, ref_all3,dr_years_list, sites_all3, refyrs_all3, dryrs_all3
+
+
+def build_site_unions(var_names, dr_names, sites_all3):
+    """
+    Build union of valid sites across drought episodes and variables.
+
+    Parameters:
+    var_names (list): List of variable names e.g. ['RDC', 'WT', 'SC']
+    dr_names (list): List of drought episode names
+    sites_all3 (dict): sites_all3[var][drought] = DataFrame of valid sites
+
+    Returns:
+    allsites (dict): {var: list} union of valid sites across all drought episodes
+    all3_all_sites (list): union of valid sites across all variables and drought episodes
+    all3vars (dict): {drought: list} sites common to all variables for each drought episode
+    """
+    # ── Union of sites per variable across all drought episodes ────────────────
+    allsites = {}
+    print('Number of sites for each variable across all drought episodes:')
+    for var in var_names:
+        allsites[var] = []
+        for dr in dr_names:
+            allsites[var] = list(set(allsites[var]) | set(sites_all3[var][dr].columns.values))
+        print(f'{var}: {len(allsites[var])}')
+
+    # ── Union across all variables too ─────────────────────────────────────────
+    all3_all_sites = list(set().union(*[allsites[var] for var in var_names]))
+    print(f'Total unique sites across all variables and episodes: {len(all3_all_sites)}')
+
+    # ── Sites common to all variables per drought episode ──────────────────────
+    print('Number of sites with all variables for each drought episode:')
+    all3vars = {}
+    for dr in dr_names:
+        var1and2 = set(sites_all3[var_names[0]][dr].columns.values).intersection(
+                   set(sites_all3[var_names[1]][dr].columns.values))
+        all3vars[dr] = list(var1and2.intersection(
+                       set(sites_all3[var_names[2]][dr].columns.values)))
+        print(f'{dr}: {len(all3vars[dr])}')
+
+    return allsites, all3_all_sites, all3vars
+    
 
 def rel_change_median_monthly(reference_data, drought_data, drought_episode):
     # Step 1: Calculate monthly medians
@@ -540,8 +362,108 @@ def rel_change_mean_annual(reference_data, drought_data, drought_episode) :
         reference_annual_median,
         annual_difference
     )
-    
 
+
+def calculate_rel_change_all(var_list, dr_names, ref_all3, dr_years,
+                              data_dict=None, refyrs_all3=None, dryrs_all3=None,
+                              use_presliced=True):
+    """
+    Calculate annual and monthly median relative change for all variables and drought episodes.
+    Can operate in two modes:
+    - use_presliced=True  : uses refyrs_all3 and dryrs_all3 (pre-sliced by drought episode)
+                            e.g. for RDC, WT, SC
+    - use_presliced=False : slices from data_dict using ref_all3 and dr_years on wyear index
+                            e.g. for MET variables (precip, temp)
+    Parameters:
+    var_list (list): List of variable names to process
+    dr_names (list): List of drought episode names
+    ref_all3 (dict): {drought: list} reference years per episode
+    dr_years (dict): {drought: list} drought years per episode
+    data_dict (dict): {var: DataFrame} used when use_presliced=False
+    refyrs_all3 (dict): {var: {drought: DataFrame}} used when use_presliced=True
+    dryrs_all3 (dict): {var: {drought: DataFrame}} used when use_presliced=True
+    use_presliced (bool): Toggle between the two slicing modes (default: True)
+
+    Returns:
+    ann_MED (dict): {var: {drought: {'relchange', 'drought', 'ref', 'diff'}}}
+    mon_MED (dict): {var: {drought: {'relchange', 'drought', 'ref', 'diff'}}}
+    """
+    ann_MED = {var: {} for var in var_list}
+    mon_MED = {var: {} for var in var_list}
+
+    for var in var_list:
+        for dr in dr_names:
+            ann_MED[var][dr] = {}
+            mon_MED[var][dr] = {}
+
+            if use_presliced:
+                df_ref = refyrs_all3[var][dr]
+                df_dr  = dryrs_all3[var][dr]
+            else:
+                df_ref = data_dict[var][data_dict[var].index.get_level_values('wyear').isin(ref_all3[dr])]
+                df_dr  = data_dict[var][data_dict[var].index.get_level_values('wyear').isin(dr_years[dr])]
+
+            (ann_MED[var][dr]['relchange'],ann_MED[var][dr]['drought'],ann_MED[var][dr]['ref'],ann_MED[var][dr]['diff'] ) = rel_change_median_annual(df_ref, df_dr, dr)
+
+            (mon_MED[var][dr]['relchange'],mon_MED[var][dr]['drought'],mon_MED[var][dr]['ref'], mon_MED[var][dr]['diff']) = rel_change_median_monthly(df_ref, df_dr, dr)
+
+    print(f"------ calculated annual and monthly median relative change for {var_list}  ------")
+    return ann_MED, mon_MED
+
+def aggregate_episodes(var_list, dr_names, ann_MED, include_dr_ref=True):
+    """
+    Concatenate relative change data across all drought episodes and average
+    sites that appear in more than one episode.
+
+    Parameters:
+    var_list (list): List of variable names to process e.g. var_names or MET_vars
+    dr_names (list): List of drought episode names
+    ann_MED (dict): {var: {drought: {'relchange', 'drought', 'ref', ...}}}
+                    as returned by calculate_rel_change_all
+    include_dr_ref (bool): If True, also aggregates 'drought' and 'ref' keys
+                           and renames columns. Use True for RDC/WT/SC,
+                           False for MET variables (default: True)
+
+    Returns:
+    MED_allsites (dict): {var: {'relchange', ...}} concatenated across all episodes
+    MED_all3 (dict):     {var: {'relchange', ...}} averaged across episodes per site
+    """
+    epis_lists   = {var: {'relchange': [], 'dr': [], 'ref': []} for var in var_list}
+    MED_allsites = {var: {} for var in var_list}
+    MED_all3     = {var: {} for var in var_list}
+
+    for var in var_list:
+        for dr in dr_names:
+            if include_dr_ref:
+                ann_MED[var][dr]['relchange'] = ann_MED[var][dr]['relchange'].to_frame().rename(columns={0: 'Relative Change (%)'})
+                ann_MED[var][dr]['drought']   = ann_MED[var][dr]['drought'].to_frame().rename(columns={0: 'DR'})
+                ann_MED[var][dr]['ref']        = ann_MED[var][dr]['ref'].to_frame().rename(columns={0: 'REF'})
+
+                epis_lists[var]['dr'].append(ann_MED[var][dr]['drought'])
+                epis_lists[var]['ref'].append(ann_MED[var][dr]['ref'])
+
+            epis_lists[var]['relchange'].append(ann_MED[var][dr]['relchange'])
+
+        # Concat and average across episodes
+        MED_allsites[var]['relchange'] = pd.concat(epis_lists[var]['relchange'])
+        MED_all3[var]['relchange']     = MED_allsites[var]['relchange'].groupby(level=0).mean()
+
+        if include_dr_ref:
+            MED_allsites[var]['dr']  = pd.concat(epis_lists[var]['dr'])
+            MED_all3[var]['dr']      = MED_allsites[var]['dr'].groupby(level=0).mean()
+
+            MED_allsites[var]['ref'] = pd.concat(epis_lists[var]['ref'])
+            MED_all3[var]['ref']     = MED_allsites[var]['ref'].groupby(level=0).mean()
+
+            print(f'Median Annual Relative Change: {var}', MED_all3[var]['relchange'].median().values)
+            print(f'Median Annual DR:              {var}', MED_all3[var]['dr'].median().values)
+            print(f'Median Annual Ref:             {var}', MED_all3[var]['ref'].median().values)
+        else:
+            print(f'Median Annual Relative Change: {var}', MED_all3[var]['relchange'].median())
+
+    return MED_allsites, MED_all3
+    
+    
 # # compute seasonal medians
 def make_seasonal_dict(year,yespriorSept=False):
     if yespriorSept: # continuous fall from last water year
@@ -580,138 +502,334 @@ def compute_seasonal_medians(monthly_medians,year,yespriorSept=False):
 
 
 def dr_ref_period_seasonal_medians(years, vartype, monthly_medians, yespriorSept, seasons):
+    """
+    Calculate seasonal medians for drought or reference years.
+
+    Parameters:
+    years (list): List of years for the period (drought or reference)
+    vartype (str): Either 'dr' or 'ref'
+    monthly_medians (DataFrame): Monthly median data with sites as columns
+    yespriorSept (bool): Whether to include prior September
+    seasons (list): List of season labels e.g. ['OND', 'JFM', 'AMJ', 'JAS']
+
+    Returns:
+    DataFrame: Seasonal medians with sites as index and seasons as columns
+    """
     sites = monthly_medians.columns
-    
-    for year in years:
-        vars()['seasonMED_'+vartype+'_'+str(year)] = compute_seasonal_medians(monthly_medians,year,yespriorSept)
-        
-    ### DROUGHT YEARS
+
+    year_medians = {year: compute_seasonal_medians(monthly_medians, year, yespriorSept) for year in years}
+
+    result = pd.DataFrame(index=sites, columns=seasons)
+
     if vartype == 'dr':
-        ## combine dr years together if need be
-        if len(years)==1:
-            seasonMED_dr = vars()['seasonMED_dr_'+str(year)]
-            
-        if len(years)==2:
-            seasonMED_dr = pd.DataFrame(index= sites, columns = seasons)
-            for season in seasons:
-                seasonMED_dr[season] = np.median([vars()['seasonMED_dr_'+str(years[0])][season], vars()['seasonMED_dr_'+str(years[1])][season]], axis=0)
-                
-    ### REFERENCE YEARS
-    if vartype == 'ref':
-        seasonMED_ref = pd.DataFrame(index= sites, columns = seasons)
-        for season in seasons:
-            vars()[season+'_all_refyears'] = pd.DataFrame(index= sites)
-        
-        for year in years:
-            ## combine ref years together  
-            for season in seasons:
-                vars()[season+'_all_refyears'][year] = vars()['seasonMED_ref_'+str(year)][season]
-        
-        for season in seasons:
-            seasonMED_ref[season] = vars()[season+'_all_refyears'].median(axis=1)
+        if len(years) == 1:
+            result = year_medians[years[0]]
 
-    return vars()['seasonMED_'+vartype]
+        elif len(years) == 2:
+            for season in seasons:
+                result[season] = np.median([year_medians[years[0]][season],year_medians[years[1]][season]],axis=0)
 
+    elif vartype == 'ref':
+        for season in seasons:
+            season_all_refyears = pd.DataFrame(index=sites)
+
+            for year in years:
+                season_all_refyears[year] = year_medians[year][season]
+
+            result[season] = season_all_refyears.median(axis=1)
+
+    else:
+        raise ValueError(f"vartype must be 'dr' or 'ref', got '{vartype}'")
+
+    return result
+
+
+def calculate_seasonal_rel_change(var_list, dr_names, dr_years, ref_all3, seasons, vartypes,
+                                   site_index_dict, yespriorSept=False,
+                                   sites_all3=None, use_presliced=True):
+    """
+    Calculate seasonal median relative change across drought episodes for all variables.
+
+    Can operate in two modes:
+    - use_presliced=True  : groups sites_all3[var][dr] by wyear/month before passing
+                            to dr_ref_period_seasonal_medians. Use for RDC, WT, SC.
+    - use_presliced=False : passes data_dict[var] directly to dr_ref_period_seasonal_medians.
+                            Use for MET variables where data is already at monthly resolution.
+
+    Parameters:
+    var_list (list): List of variable names to process
+    dr_names (list): List of drought episode names
+    dr_years (dict): {drought: list} drought years per episode
+    ref_all3 (dict): {drought: list} reference years per episode
+    seasons (list): List of season labels e.g. ['OND', 'JFM', 'AMJ', 'JAS']
+    vartypes (list): List of value types e.g. ['dr', 'ref', 'relchange']
+    site_index_dict (dict): {var: list or Index} sites to use as DataFrame index per variable.
+                             For RDC/WT/SC pass allsites, for MET pass {MET: congruent_sites[MET].columns}
+    yespriorSept (bool): Whether to include prior September (default: False)
+    sites_all3 (dict): {var: {drought: DataFrame}} used when use_presliced=True
+    use_presliced (bool): Toggle between the two modes (default: True)
+
+    Returns:
+    seasonMED (dict):      {var: {drought: {vartype: DataFrame}}}
+    seasonMED_all (dict):  {var: {vartype: DataFrame}} averaged across episodes
+    allep_seasonal (dict): {var: {vartype: DataFrame}} median across sites per season
+    allep_combined (dict): {var: DataFrame} final concat of dr, ref, relchange
+    """
+    seasonMED      = {var: {dr: {} for dr in dr_names} for var in var_list}
+    seasonMED_all  = {var: {} for var in var_list}
+    allep_seasonal = {var: {} for var in var_list}
+    allep_combined = {}
+
+    for var in var_list:
+        sites = site_index_dict[var]
+
+        season_epis = {
+            season: {vt: pd.DataFrame(index=sites) for vt in vartypes}
+            for season in seasons
+        }
+
+        for dr in dr_names:
+            if use_presliced:
+                mon_data = sites_all3[var][dr].groupby(level=['wyear', 'month']).median()
+            else:
+                mon_data = site_index_dict['data'][var]
+                df_ref = data_dict[var][data_dict[var].index.get_level_values('wyear').isin(ref_all3[dr])]
+                df_dr  = data_dict[var][data_dict[var].index.get_level_values('wyear').isin(dr_years[dr])]
+
+            # dr and ref seasonal medians
+            seasonMED[var][dr]['dr'] = dr_ref_period_seasonal_medians(dr_years[dr], 'dr', mon_data, yespriorSept, seasons)
+
+            seasonMED[var][dr]['ref'] = dr_ref_period_seasonal_medians(ref_all3[dr], 'ref', mon_data, yespriorSept, seasons)
+
+            # relative change 
+            reference_divisor = seasonMED[var][dr]['ref'].copy().replace(0, 1e-10)
+            seasonMED[var][dr]['relchange'] = (
+                (seasonMED[var][dr]['dr'] - reference_divisor) / reference_divisor.abs() * 100
+            )
+
+        # average across drought episodes 
+        for vartype in vartypes:
+            seasonMED_all[var][vartype] = pd.DataFrame(index=sites, columns=seasons)
+
+            for season in seasons:
+                for dr in dr_names:
+                    season_epis[season][vartype][dr] = seasonMED[var][dr][vartype][season]
+
+                seasonMED_all[var][vartype][season] = season_epis[season][vartype].mean(axis=1)
+
+            allep_seasonal[var][vartype] = (
+                seasonMED_all[var][vartype].median()
+                .to_frame()
+                .rename(columns={0: vartype})
+            )
+
+        allep_combined[var] = pd.concat([allep_seasonal[var][vt] for vt in vartypes], axis=1)
+        print(f'{var} Median SEASONAL Relative Change:\n', allep_combined[var])
+
+    return seasonMED, seasonMED_all, allep_seasonal, allep_combined
+
+
+    
+def calculate_longterm_avg(ready, allsites, var_names, longterm_avg_start=1998, end_year=2022):
+    """
+    Calculate long-term climatology averages for each variable.
+
+    Parameters:
+    ready (dict): {var: DataFrame} normalized/prepared data keyed by variable name
+    allsites (dict): {var: list} union of valid sites per variable
+    var_names (list): List of variable names e.g. ['RDC', 'WT', 'SC']
+    longterm_avg_start (int): Start year for long-term average (default: 1998)
+    end_year (int): End year for long-term average (default: 2022)
+
+    Returns:
+    longtermavg (dict): {var: DataFrame} pruned data for long-term period
+    basin_avg (dict): {var: Series} monthly mean averaged across all sites
+    """
+    longtermavg = {}
+    basin_avg = {}
+
+    for var in var_names:
+        longtermavg[var] = ready[var][allsites[var]]
+
+        wyear = longtermavg[var].index.get_level_values('wyear')
+        longtermavg[var] = longtermavg[var][(wyear >= longterm_avg_start) & (wyear <= end_year)]
+
+        basin_avg[var] = longtermavg[var].groupby(level=1, sort=False).mean().mean(axis=1)
+
+    return longtermavg, basin_avg
+
+
+def build_site_dicts_no_filter(ref_all3, dr_names, list_all_years, list_ref_years, list_dr_years,
+                                var_names, list_all_data):
+    """
+    Build drought/reference/site dictionaries without availability filtering.
+
+    Parameters:
+    ref_all3: list of lists of drought years per episode
+    dr_names (list): Drought episode names
+    list_all_years (list): All years per drought episode
+    list_ref_years (list): Reference years per drought episode
+    list_dr_years (list): Drought years per drought episode
+    var_names (list): Variable names matching order of list_all_data
+    list_all_data (list): DataFrames per variable
+
+    Returns:
+    sites_all3, refyrs_all3, dryrs_all3
+    """
+
+    # Full data copy per var/drought — no availability filtering
+    sites_all3 = {var: {} for var in var_names}
+    for num, var in enumerate(var_names):
+        for drought in dr_names:
+            sites_all3[var][drought] = list_all_data[num].copy()
+
+    # Reference year slices
+    refyrs_all3 = {var: {} for var in var_names}
+    for dr in dr_names:
+        for var in var_names:
+            refyrs_all3[var][dr] = sites_all3[var][dr].transpose()[ref_all3[dr]].transpose()
+
+    # Drought year slices
+    dryrs_all3    = {var: {} for var in var_names}
+    dr_names_1yr  = ['2012', '2018']
+
+    for dr in dr_names_1yr:
+        for var in var_names:
+            dryrs_all3[var][dr] = sites_all3[var][dr].transpose()[int(dr)].transpose()
+
+    for var in var_names:
+        dryrs_all3[var]['2001_2002'] = sites_all3[var]['2001_2002'].transpose()[[2001, 2002]].transpose()
+        dryrs_all3[var]['2020_2021'] = sites_all3[var]['2020_2021'].transpose()[[2020, 2021]].transpose()
+
+    print("------ created site dictionaries (no availability filtering) ------")
+
+    return sites_all3, refyrs_all3, dryrs_all3
 
 # # getting long term climatology
-def calculate_meteorological_climatology(meteorological_data, common_sites, drought_years, 
+def calculate_meteorological_climatology(meteorological_data, common_sites, drought_years,
                                          longterm_avg_start=1998, end_year=2022):
     """
     Calculate meteorological climatology statistics for different time periods and drought events.
-    
+
     Parameters:
     meteorological_data (list): List of DataFrames containing meteorological variables data
-    common_sites (list): List of site IDs that are common across all datasets
+    common_sites (list): List of site IDs common across all datasets
     drought_years (list): List of individual drought years
-    longterm_avg_start (int): Start year for long-term average calculation (default: 2000)
+    longterm_avg_start (int): Start year for long-term average (default: 1998)
     end_year (int): End year for calculations (default: 2022)
-    
+
     Returns:
-    dict: Dictionary containing:
-        - Long-term basin averages for each variable
-        - Site-specific data for each variable
-        - Drought-year averages for each variable
-    """
-    
-    # Initialize result dictionary
+    tuple: longterm precip avg, longterm temp avg, precip site data,
+           temp site data, precip drought avg list, temp drought avg list
+    """    
     result = {
-        'long_term_basin_avg': {},
-        'site_data': {},
-        'drought_avg': {},
+        'site_data':       {},
+        'drought_avg':     {},
         'drought_avg_list': {}
     }
-    
-    # Process each meteorological variable
+
+    # Filter and organize site data per MET variable
+    met_ready = {}
+    met_allsites = {}
+
     for var_idx, variable in enumerate(MET_vars):
-        # Get data for current variable
         var_data = meteorological_data[var_idx]
-        
-        # Filter for common sites across all datasets
-        common_sites_data = var_data[list(set(var_data.columns) & set(common_sites))]
-        
-        # Store site-specific data
-        result['site_data'][variable] = common_sites_data
-        
-        # Calculate average for each drought year
+        common   = list(set(var_data.columns) & set(common_sites))
+        result['site_data'][variable] = var_data[common]
+
+        # Structure inputs for calculate_longterm_avg
+        met_ready[variable] = var_data
+        met_allsites[variable] = common
+
+    _, longterm_basin_avgs = calculate_longterm_avg(
+        met_ready, met_allsites, MET_vars, longterm_avg_start, end_year
+    )
+
+    # Drought year averages
+    for var_idx, variable in enumerate(MET_vars):
+        common_sites_data = result['site_data'][variable]
         drought_year_avgs = {}
         drought_avg_list = []
-        
+
         for year in drought_years:
-            # Extract data for the specific drought year
             if year in common_sites_data.index.get_level_values('wyear'):
                 year_data = common_sites_data.xs(year, level='wyear')
-                # Calculate monthly average across all sites for this year
                 year_avg = year_data.mean(axis=1)
                 drought_year_avgs[str(year)] = year_avg
                 drought_avg_list.append(year_avg)
             else:
                 print(f"Warning: Year {year} not found in {variable} data")
                 drought_year_avgs[str(year)] = None
-        
-        # Handle multi-year drought events (assuming they're consecutive years)
-        # Find consecutive years in drought_years
+
+        #  Combined consecutive drought year averages 
         for i in range(len(drought_years) - 1):
-            if drought_years[i] + 1 == drought_years[i+1]:
-                # Create a combined average for consecutive drought years
-                year1 = str(drought_years[i])
-                year2 = str(drought_years[i+1])
-                combined_name = f"{year1}_{year2}"
-                
-                if drought_year_avgs[year1] is not None and drought_year_avgs[year2] is not None:
-                    combined_avg = (drought_year_avgs[year1] + drought_year_avgs[year2]) / 2
-                    drought_year_avgs[combined_name] = combined_avg
-        
-        # Calculate long-term average (from start year to end year)
-        # Filter data for the long-term period
-        longterm_data = common_sites_data[
-            (common_sites_data.index.get_level_values('wyear') >= longterm_avg_start) &
-            (
-                (common_sites_data.index.get_level_values('wyear') <= end_year) | 
-                (
-                    (common_sites_data.index.get_level_values('wyear') == end_year + 1) & 
-                    (common_sites_data.index.get_level_values('month') <= 9)
-                )
-            )
-        ]
-        
-        # Calculate basin-wide average by month for the long-term period
-        longterm_basin_avg = longterm_data.mean(axis=1).groupby(level=1, sort=False).mean()
-        
-        # Store results
-        result['long_term_basin_avg'][variable] = longterm_basin_avg
-        result['drought_avg'][variable] = drought_year_avgs
+            if drought_years[i] + 1 == drought_years[i + 1]:
+                y1, y2 = str(drought_years[i]), str(drought_years[i + 1])
+                if drought_year_avgs[y1] is not None and drought_year_avgs[y2] is not None:
+                    drought_year_avgs[f'{y1}_{y2}'] = (drought_year_avgs[y1] + drought_year_avgs[y2]) / 2
+
+        result['drought_avg'][variable]      = drought_year_avgs
         result['drought_avg_list'][variable] = drought_avg_list
-    
-    # Return specific outputs to maintain backward compatibility
-    return (
-        result['long_term_basin_avg'].get('precip', None),
-        result['long_term_basin_avg'].get('temp', None),
-        result['site_data'].get('precip', None),
-        result['site_data'].get('temp', None),
-        result['drought_avg_list'].get('precip', []),
-        result['drought_avg_list'].get('temp', [])
-    )
-    
+
+    basin_avg    = {}
+    congruent_sites = {}
+    met_avg_list = {}
+
+    for var_idx, variable in enumerate(MET_vars):
+        basin_avg[variable]       = longterm_basin_avgs[variable]
+        congruent_sites[variable] = result['site_data'][variable]
+        met_avg_list[variable]    = result['drought_avg_list'][variable]
+
+    return basin_avg, congruent_sites, met_avg_list
+        
+
+def calculate_percentile_rel_change(var_names, dr_names, refyrs_all3, dryrs_all3):
+    """
+    Calculate 95th and 5th percentile values and their relative changes
+    for drought vs reference periods across all variables and drought episodes.
+
+    Multi-year episodes require a groupby before quantile to get one value per year
+    before taking the median. Single-year episodes can take the quantile directly.
+
+    Parameters:
+    var_names (list): List of variable names e.g. ['RDC', 'WT', 'SC']
+    dr_names (list): List of drought episode names, where index 0 and 3 are
+                     multi-year episodes and index 1 and 2 are single-year episodes
+    refyrs_all3 (dict): {var: {drought: DataFrame}} reference year slices
+    dryrs_all3 (dict): {var: {drought: DataFrame}} drought year slices
+
+    Returns:
+    pct (dict): {var: {drought: {'ref_95', 'dr_95', 'ref_5', 'dr_5',
+                                  'relchange_95', 'relchange_5'}}}
+    """
+    pct = {var: {dr: {} for dr in dr_names} for var in var_names}
+
+    multi_yr_episodes  = [dr_names[0], dr_names[3]]
+    single_yr_episodes = [dr_names[1], dr_names[2]]
+
+    for var in var_names:
+
+        # Multi-year episodes: groupby wyear then median
+        for dr in multi_yr_episodes:
+            pct[var][dr]['ref_95'] = refyrs_all3[var][dr].groupby(level='wyear').quantile(0.95).median()
+            pct[var][dr]['dr_95']  = dryrs_all3[var][dr].groupby(level='wyear').quantile(0.95).median()
+            pct[var][dr]['ref_5']  = refyrs_all3[var][dr].groupby(level='wyear').quantile(0.05).median()
+            pct[var][dr]['dr_5']   = dryrs_all3[var][dr].groupby(level='wyear').quantile(0.05).median()
+
+        # Single-year episodes: quantile directly
+        for dr in single_yr_episodes:
+            pct[var][dr]['ref_95'] = refyrs_all3[var][dr].groupby(level='wyear').quantile(0.95).median()
+            pct[var][dr]['dr_95']  = dryrs_all3[var][dr].quantile(0.95)
+            pct[var][dr]['ref_5']  = refyrs_all3[var][dr].groupby(level='wyear').quantile(0.05).median()
+            pct[var][dr]['dr_5']   = dryrs_all3[var][dr].quantile(0.05)
+
+        # Relative change for all
+        for dr in dr_names:
+            for pct_key, dr_key, ref_key in [('relchange_95', 'dr_95', 'ref_95'),('relchange_5',  'dr_5',  'ref_5')]:
+                pct[var][dr][pct_key] = (((pct[var][dr][dr_key] - pct[var][dr][ref_key]) / pct[var][dr][ref_key]) * 100).to_frame().reset_index().rename(columns={0: 'Relative Change (%)', 'index': 'SiteId'})
+
+    print("------ calculated relative change for peak and low RDC, WT, SC ------")
+    return pct
 
 
 def prep_mapping(mapping_data_list, metadata_filtered_dfs, gages_reference_data, all_var=True,huc_code='14'):
@@ -734,7 +852,7 @@ def prep_mapping(mapping_data_list, metadata_filtered_dfs, gages_reference_data,
     ].index)
     
     # Process each variable
-    enhanced_mapping_data = []
+    enhanced_mapping_data = {}
     
     for var_idx, variable in enumerate(var_names):
         if not all_var:
@@ -752,8 +870,8 @@ def prep_mapping(mapping_data_list, metadata_filtered_dfs, gages_reference_data,
         # Add coordinates from metadata
         for site in var_mapping_data.index:
             if site in var_metadata.columns:
-                var_mapping_data.at[site, 'LAT'] = var_metadata.loc['sampling_feature_lat', site]
-                var_mapping_data.at[site, 'LON'] = var_metadata.loc['sampling_feature_long', site]
+                var_mapping_data.at[site, 'LAT'] = float(var_metadata.loc['sampling_feature_lat', site])
+                var_mapping_data.at[site, 'LON'] = float(var_metadata.loc['sampling_feature_long', site])
         
         # Add reference site classification
         var_mapping_data['CLASS'] = 'Non-Ref'
@@ -765,8 +883,8 @@ def prep_mapping(mapping_data_list, metadata_filtered_dfs, gages_reference_data,
         if variable == 'WT':
             # Identify sites with missing coordinates
             missing_coord_sites = var_mapping_data[
-                (var_mapping_data['LAT'] == 0) | 
-                (var_mapping_data['LON'] == 0)
+                (var_mapping_data['LAT'] == 0.0) | 
+                (var_mapping_data['LON'] == 0.0)
             ].index
             
             # Fill in missing coordinates from GAGES-II data
@@ -783,10 +901,51 @@ def prep_mapping(mapping_data_list, metadata_filtered_dfs, gages_reference_data,
         var_mapping_data['Relative Change (%)'] = var_mapping_data['Relative Change (%)'].astype(float)
         
         # Add to result list
-        enhanced_mapping_data.append(var_mapping_data)
+        enhanced_mapping_data[variable] = var_mapping_data
     
     return enhanced_mapping_data            
 
+
+def calculate_percentile_map_data(var_names, dr_names, pct, list_metadata_filtered_dfs, gagesii):
+    """
+    Prepare percentile relative change data for spatial mapping.
+    Averages relative change across all drought episodes per variable and percentile.
+
+    Parameters:
+    var_names (list): Variable names e.g. ['RDC', 'WT', 'SC']
+    dr_names (list): Drought episode names
+    pct (dict): {var: {dr: {'relchange_95': DataFrame, 'relchange_5': DataFrame}}}
+                percentile relative change data per variable and drought episode
+    list_metadata_filtered_dfs (list): Metadata DataFrames passed to prep_mapping
+    gagesii: GAGESII data passed to prep_mapping
+
+    Returns:
+    pct_map (dict): {var: {'95': DataFrame, '5': DataFrame}} spatially-ready
+                    percentile relative change data with LAT/LON/CLASS columns
+    """
+    pct_map = {var: {} for var in var_names}
+
+    for val in ['95', '5']:
+        relchange_ready = []
+
+        for var in var_names:
+            list_mapping_per = []
+
+            for dr in dr_names:
+                list_mapping_per.append(pct[var][dr][f'relchange_{val}'].set_index('SiteId').rename_axis(None))
+
+            # Average relative change across all drought episodes
+            mean_relchange = pd.concat(list_mapping_per).groupby(level=0).mean()
+            relchange_ready.append(mean_relchange)
+
+        mapping_return = prep_mapping(relchange_ready, list_metadata_filtered_dfs, gagesii)
+
+        for var in var_names:
+            pct_map[var][val] = mapping_return[var]
+
+    print("------ Percentile map data prepared ------")
+    return pct_map
+    
 
 def identify_years_site(site):
     """
@@ -876,6 +1035,232 @@ def get_recovery_years(baselinelength, dr, dr_years, ref_years, annmedians_pos, 
     return first_year_back,yearssince
 
 
+def build_annual_medians_by_rc(var_names, dr_names, MED_all3, sites_all3):
+    """
+    Separate sites by relative change sign and calculate annual medians
+    across all drought episodes.
+
+    Parameters:
+    var_names (list): List of variable names
+    dr_names (list): List of drought episode names
+    MED_all3 (dict): {var: {'relchange': DataFrame}} as returned by aggregate_episodes()
+    sites_all3 (dict): {var: {drought: DataFrame}} valid sites per var per episode
+
+    Returns:
+    MED_relchange_map (dict): {var: DataFrame} relative change renamed for mapping
+    sites_by_rc (dict): {var: {'pos','neg','all'}} site indices by rel change sign
+    combined_dr (dict): {var: DataFrame} all episodes combined via combine_first
+    annual_medians (dict): {var: DataFrame} annual medians across all drought episodes
+    ann_med_rc (dict): {var: {'pos','neg'}} annual medians filtered by rel change sign
+    """
+    MED_relchange_map = {}
+    sites_by_rc       = {}
+    combined_dr       = {}
+    annual_medians    = {}
+    ann_med_rc        = {var: {} for var in var_names}
+
+    for var in var_names:
+        # ── Rename and separate by sign ────────────────────────────────────────
+        MED_relchange_map[var] = MED_all3[var]['relchange'].copy()
+
+        col = 'Relative Change (%)'
+        sites_by_rc[var] = {
+            'pos': MED_relchange_map[var][MED_relchange_map[var][col] >= 0].index,
+            'neg': MED_relchange_map[var][MED_relchange_map[var][col] <  0].index,
+            'all': MED_relchange_map[var].index
+        }
+
+        # ── Combine all episodes and compute annual medians ────────────────────
+        combined_dr[var] = (
+            sites_all3[var][dr_names[0]]
+            .combine_first(sites_all3[var][dr_names[1]])
+            .combine_first(sites_all3[var][dr_names[2]])
+            .combine_first(sites_all3[var][dr_names[3]])
+        )
+        annual_medians[var] = combined_dr[var].groupby(level=['wyear']).median()
+
+        for rc in ['pos', 'neg']:
+            ann_med_rc[var][rc] = annual_medians[var][sites_by_rc[var][rc]]
+
+    print("------ separated sites by relative change sign and built annual medians ------")
+    return MED_relchange_map, sites_by_rc, combined_dr, annual_medians, ann_med_rc
+
+
+def calculate_recovery(var_names, dr_names, dr_years, ref_all3, ann_med_rc,
+                        sites_all3, avail, numyears, firstyrback, baselinelength=3):
+    """
+    Calculate recovery years and data availability for each variable,
+    drought episode, and relative change type.
+
+    Parameters:
+    var_names (list): List of variable names
+    dr_names (list): List of drought episode names
+    dr_years (dict): {drought: list} drought years per episode
+    ref_all3 (dict): {drought: list} reference years per episode
+    ann_med_rc (dict): {var: {'pos','neg'}} annual medians filtered by rel change sign
+    sites_all3 (dict): {var: {drought: DataFrame}} valid sites per var per episode
+    avail (dict): {var: DataFrame} availability data
+    numyears (dict): {var: {'pos','neg'}} concatenated years since recovery
+    firstyrback (dict): {var: {'pos','neg'}} concatenated first year back
+    baselinelength (int): Number of baseline years (default: 3)
+
+    Returns:
+    recovery (dict): {var: {drought: {'pos','neg': {recov_years, recov_year,
+                     avail_aftdr, avail_aftdr_df, notrecov, missing_aftdr,
+                     notrecov_nomissing, recyears_nononrec}}}}
+    dr_timing (dict): {drought: {'firstdryr','lastdryr','yearsbefore','yearsafter'}}
+    """
+    dr_timing = {}
+    recovery  = {var: {dr: {} for dr in dr_names} for var in var_names}
+
+    for var in var_names:
+        for dr in dr_names:
+            first_last_year, yearsarounddrought = get_years_before_after(
+                baselinelength, dr_years[dr], ref_all3[dr]
+            )
+
+            dr_timing[dr] = {
+                'firstdryr'   : first_last_year[0],
+                'lastdryr'    : first_last_year[-1],
+                'yearsbefore' : yearsarounddrought[0],
+                'yearsafter'  : yearsarounddrought[-1]
+            }
+            yearsafter = dr_timing[dr]['yearsafter']
+
+            for rc in ['pos', 'neg']:
+                r = {}
+
+                # ── Filter to sites in this episode ────────────────────────────
+                sites_for_dr = list(
+                    set(numyears[var][rc].index.values)
+                    .intersection(set(sites_all3[var][dr].columns.values))
+                )
+
+                r['recov_years'] = numyears[var][rc].loc[sites_for_dr][dr]
+                r['recov_year']  = firstyrback[var][rc].loc[sites_for_dr][dr]
+
+                didnotrecover     = r['recov_years'].isna()
+                didnotrecoverlist = r['recov_years'][didnotrecover].index
+
+                r['avail_aftdr']    = avail[var][didnotrecoverlist].loc[yearsafter[0]:]
+                r['avail_aftdr_df'] = r['avail_aftdr'].sum().to_frame().rename(columns={0: dr})
+                r['missing_aftdr']  = r['avail_aftdr'].loc[
+                    :, (r['avail_aftdr'] == 0).any(axis=0)
+                ]
+
+                r['notrecov'] = r['recov_years'][didnotrecover].replace(np.nan, -1)
+                r['notrecov_nomissing'] = r['notrecov'].drop(index=r['missing_aftdr'].columns)
+                r['notrecov_nomissing'].replace(to_replace={-1: 24}, inplace=True)
+
+                overlapping_sites      = list(set(r['notrecov'].index).intersection(set(r['recov_years'].index)))
+                r['recyears_nononrec'] = r['recov_years'].drop(index=overlapping_sites)
+
+                recovery[var][dr][rc] = r
+
+                # ── Print summary ──────────────────────────────────────────────
+                print(var, dr, rc)
+                print(f"  Did not reach recovery: {didnotrecover.sum()}"
+                      f"; Missing data to 2022: {len(r['missing_aftdr'].columns)}")
+                print(f"  Mean yrs:   {np.nanmean(r['recov_years']):.2f}"
+                      f"; Median yrs: {np.nanmedian(r['recov_years']):.2f}"
+                      f"; Max yrs:    {np.nanmax(r['recov_years']):.2f}"
+                      f"; Min yrs:    {np.nanmin(r['recov_years']):.2f}")
+
+    return recovery, dr_timing
+
+
+def build_recovery_summary(var_names, dr_names, recovery):
+    """
+    Concatenate recovery years across drought episodes and print summary statistics.
+
+    Parameters:
+    var_names (list): List of variable names
+    dr_names (list): List of drought episode names
+    recovery (dict): {var: {drought: {rc: {...}}}} as returned by calculate_recovery()
+
+    Returns:
+    alldr_recyrs_df (dict): {var: {'pos','neg': DataFrame}} recovery years as DataFrame
+    """
+    alldr_recyrs_df = {var: {} for var in var_names}
+
+    for var in var_names:
+        for rc in ['neg', 'pos']:
+            alldr_recyrs_df[var][rc] = pd.concat(
+                {dr: recovery[var][dr][rc]['recyears_nononrec'] for dr in dr_names[:-1]},
+                axis=1
+            )
+
+            print(f"\n{var} | {rc}")
+            for dr in dr_names[:-1]:
+                s = recovery[var][dr][rc]['recyears_nononrec']
+                print(f"  {dr}: # sites recovered: {len(s.index)}, median yrs: {s.median():.2f}")
+
+            overall_median = alldr_recyrs_df[var][rc].median(axis=1).median()
+            print(f"  All episodes — # sites: {len(alldr_recyrs_df[var][rc].index)}, "
+                  f"median yrs: {overall_median:.2f}")
+
+    print('\nSites that did not recover with positive or negative rel change during drought:')
+    for var in var_names:
+        for dr in dr_names[:-1]:
+            print(var, dr)
+            for rc in ['neg', 'pos']:
+                print(rc, np.sort(recovery[var][dr][rc]['notrecov_nomissing'].index.values))
+
+    return alldr_recyrs_df
+
+
+def build_recovery_year_dicts(var_names, dr_names, dr_years, ref_all3,
+                               ann_med_rc, baselinelength=3):
+    """
+    Accumulate first year back and years since recovery across all drought episodes.
+
+    Parameters:
+    var_names (list): List of variable names
+    dr_names (list): List of drought episode names
+    dr_years (dict): {drought: list} drought years per episode
+    ref_all3 (dict): {drought: list} reference years per episode
+    ann_med_rc (dict): {var: {'pos','neg'}} annual medians by rel change sign
+    baselinelength (int): Number of baseline years (default: 3)
+
+    Returns:
+    firstyrback (dict): {var: {'pos','neg'}} concatenated first year back across episodes
+    numyears (dict): {var: {'pos','neg'}} concatenated years since recovery across episodes
+    """
+    alldrs_rc     = {var: {'pos': [], 'neg': []} for var in var_names}
+    yearssince_rc = {var: {'pos': [], 'neg': []} for var in var_names}
+    firstyearback = {var: {dr: {} for dr in dr_names} for var in var_names}
+    yrs_since     = {var: {dr: {} for dr in dr_names} for var in var_names}
+
+    for var in var_names:
+        for dr in dr_names:
+            first_year_back, yrs_since_dr = get_recovery_years(
+                baselinelength, dr, dr_years[dr], ref_all3[dr],
+                ann_med_rc[var]['pos'], ann_med_rc[var]['neg']
+            )
+
+            firstyearback[var][dr]['pos'] = first_year_back[0]
+            firstyearback[var][dr]['neg'] = first_year_back[-1]
+            yrs_since[var][dr]['pos']     = yrs_since_dr[0]
+            yrs_since[var][dr]['neg']     = yrs_since_dr[-1]
+
+            for rc in ['pos', 'neg']:
+                alldrs_rc[var][rc].append(firstyearback[var][dr][rc])
+                yearssince_rc[var][rc].append(yrs_since[var][dr][rc])
+
+    firstyrback = {
+        var: {rc: pd.concat(alldrs_rc[var][rc], axis=1) for rc in ['pos', 'neg']}
+        for var in var_names
+    }
+    numyears = {
+        var: {rc: pd.concat(yearssince_rc[var][rc], axis=1) for rc in ['pos', 'neg']}
+        for var in var_names
+    }
+
+    print("------ calculated number of years to pre-event baseline ------")
+    return firstyrback, numyears
+
+    
+
 def mann_kendall_table(df,newdf):
     """
     runs MK test and gets table of results for each site,
@@ -891,21 +1276,97 @@ def mann_kendall_table(df,newdf):
         site_series = df[site]
         startyr,endyr,totalyrs,nonnan = identify_years_site(site_series)
         trend,h,p,z,tau,s,var_s,slope,intercept =  mk.original_test(nonnan)
-        newdf.at[site,'startyr'] = startyr.astype('int')
-        newdf.at[site,'endyr'] = endyr.astype('int')
-        newdf.at[site,'totalyrs'] = totalyrs
-        newdf.at[site,'trend'] = trend
-        newdf.at[site,'h'] = h.astype('bool')
-        newdf.at[site,'p'] = p.astype('float')
-        newdf.at[site,'z'] = float(z)
-        newdf.at[site,'tau'] = tau.astype('float')
-        newdf.at[site,'s'] = s.astype('float')
-        newdf.at[site,'var_s'] = float(var_s)
-        newdf.at[site,'slope'] = slope.astype('float')
-        newdf.at[site,'intercept'] = intercept.astype('float')
+
+        newdf.at[site, 'startyr']    = int(startyr)
+        newdf.at[site, 'endyr']      = int(endyr)
+        newdf.at[site, 'totalyrs']   = int(totalyrs)
+        newdf.at[site, 'trend']      = str(trend)
+        newdf.at[site, 'h']          = bool(h)
+        newdf.at[site, 'p']          = float(p)
+        newdf.at[site, 'z']          = float(z)
+        newdf.at[site, 'tau']        = float(tau)
+        newdf.at[site, 's']          = float(s)
+        newdf.at[site, 'var_s']      = float(var_s)
+        newdf.at[site, 'slope']      = float(slope)
+        newdf.at[site, 'intercept']  = float(intercept)
     return newdf
 
+def run_mann_kendall_all(ready, met_wyear, runoff_efficiency_ann, reservoirs_years,
+                          var_names, MET_vars, allsites, start_year=1998, end_year=2022):
+    """
+    Filter data to sites of interest, average to water years, and run
+    Mann-Kendall test for all variables.
 
+    Parameters:
+    ready (dict): {var: DataFrame} normalized data keyed by variable name
+    met_wyear (dict): {MET: DataFrame} water year MET data
+    runoff_efficiency_ann (DataFrame): Annual runoff efficiency data
+    reservoirs_years (DataFrame): Annual reservoir data prepped by prep_reservoir_data()
+    var_names (list): List of variable names e.g. ['RDC', 'WT', 'SC']
+    MET_vars (list): List of MET variable names e.g. ['precip', 'temp']
+    allsites (dict): {var: list} union of valid sites per variable
+    start_year (int): Start year for filtering (default: 1998)
+    end_year (int): End year for filtering (default: 2022)
+
+    Returns:
+    mk (dict): {var: {'template': DataFrame, 'results': DataFrame}}
+    years (dict): {var: DataFrame} annual water year data per variable
+    """
+    columnvals    = ['startyr', 'endyr', 'totalyrs', 'trend', 'h', 'p', 'z',
+                     'tau', 's', 'var_s', 'slope', 'intercept']
+
+    # Step 1: Filter sites
+    withsites = {}
+    for var in var_names:
+        withsites[var] = ready[var][allsites[var]]
+    for MET in MET_vars:
+        withsites[MET] = met_wyear[MET][allsites['RDC']]
+
+    # Step 2 & 3: Mean to water years and isolate period
+    ann   = {}
+    years = {}
+
+    for var in all_variables:
+        ann[var]   = withsites[var].groupby(level=[0]).mean()
+        years[var] = ann[var].loc[start_year:end_year]
+        years[var] = years[var].dropna(how='all', axis=1)
+
+    years['runoff_efficiency'] = runoff_efficiency_ann[allsites['RDC']]
+    years['reservoirs']        = reservoirs_years
+
+    # Step 4: Mann-Kendall test
+    mk = {}
+    for var in all_vars_qp:
+        mk[var] = {}
+        mk[var]['template'] = pd.DataFrame(index=years[var].columns, columns=columnvals)
+        mk[var]['results']  = mann_kendall_table(years[var], mk[var]['template'])
+
+    print("------ computed MK test for RDC, WT, SC, precip, temp, runoff_efficiency, reservoirs ------")
+    return mk, years, withsites
+
+
+def filter_mk_trends(mk):
+    """
+    Filter Mann-Kendall results into no trend, increasing, and decreasing subsets.
+
+    Parameters:
+    mk (dict): {var: {'results': DataFrame}} as returned by run_mann_kendall_all()
+    all_vars_qp (list): List of all variable names including runoff_efficiency and reservoirs
+
+    Returns:
+    mk_trends (dict): {var: {'notrend', 'increasing', 'decreasing'}}
+    """
+    mk_trends = {var: {} for var in all_vars_qp}
+
+    for var in all_vars_qp:
+        print(var, ', Sites per each type of trend result:')
+        print(mk[var]['results']['trend'].value_counts())
+
+        mk_trends[var]['notrend']    = mk[var]['results'][mk[var]['results']['trend'] == 'no trend']
+        mk_trends[var]['increasing'] = mk[var]['results'][mk[var]['results']['trend'] == 'increasing']
+        mk_trends[var]['decreasing'] = mk[var]['results'][mk[var]['results']['trend'] == 'decreasing']
+
+    return mk_trends
 
 def boxcox_transform_dataframe(df):
     """
@@ -934,11 +1395,13 @@ def boxcox_transform_dataframe(df):
             lambdas[col] = None
             continue
 
-        # Check for positive values (Box-Cox requires strictly positive)
+        # Check for positive values (Box-Cox requires strictly positive) << not really an issue since all are positive
         min_val = valid.min()
         if min_val <= 0:
-            # Shift data by abs(min_val) + small epsilon to make all values positive
-            shift = abs(min_val) + 1e-6
+            # Shift data by abs(min_val) + 1% of mean to normalize
+            mean_val = valid[valid > 0].mean()
+            epsilon = mean_val * 0.01  # 1% of the mean
+            shift = abs(min_val) + epsilon
             shifted = valid + shift
             transformed_data, lam = stats.boxcox(shifted)
         else:
@@ -1075,3 +1538,282 @@ def run_drought_regressions(Q_all, P_all, drought_years):
         
     results_df = pd.DataFrame(results).set_index('site')
     return results_df, I_all
+
+def run_regression_analysis(runoff_years, P_years, list_dr_years):
+    """
+    Apply Box-Cox transformation to runoff, run drought regressions,
+    and filter results by significance and direction.
+
+    Parameters:
+    runoff_years (DataFrame): Annual runoff data as returned by prep_regression_data()
+    P_years (DataFrame): Annual precipitation data as returned by prep_regression_data()
+    list_dr_years (list): List of lists of drought years per episode
+                          e.g. [[2001,2002],[2012],[2018],[2020,2021]]
+
+    Returns:
+    results (DataFrame): Regression results with columns a0, a1, a2, pval_a1, rho
+    sig_pos (array): Site IDs with significant positive a1
+    sig_neg (array): Site IDs with significant negative a1
+    notsig (array): Site IDs with non-significant a1
+    runoff_boxcox (DataFrame): Box-Cox transformed runoff data
+    I_all: df signifying drought and nondrought
+    """
+    # Flatten drought years across all episodes
+    dryears = [yr for episode in list_dr_years for yr in episode]
+
+    # Box-Cox transformation
+    runoff_boxcox, lambdas = boxcox_transform_dataframe(runoff_years)
+
+    # Run regressions
+    results, I_all = run_drought_regressions(runoff_boxcox, P_years, dryears)
+
+    # Filter by significance and direction
+    sig_pos = results[(results['pval_a1'] < 0.05) & (results['a1'] >= 0)].index.values
+    sig_neg = results[(results['pval_a1'] < 0.05) & (results['a1'] <  0)].index.values
+    notsig  = results[results['pval_a1'] >= 0.05].index.values
+
+    print(f'Significant a1:          {len(results[results["pval_a1"] < 0.05])}')
+    print(f'Positive significant a1: {len(sig_pos)}')
+    print(f'Negative significant a1: {len(sig_neg)}')
+    print(f'Not significant a1:      {len(notsig)}')
+
+    return results, sig_pos, sig_neg, notsig, runoff_boxcox, I_all
+
+def calculate_prepost_rel_change(var_names, MET_vars, dr_names, dr_years, ref_all3,
+                                  annual_medians, sites_all3, mk_trends,
+                                  all_vars_qp, mk_types, start_year=1998, end_year=2022):
+    """
+    Calculate pre-to-post drought relative change and filter by Mann-Kendall trend type.
+
+    Parameters:
+    var_names (list): List of variable names e.g. ['RDC', 'WT', 'SC']
+    MET_vars (list): List of MET variable names e.g. ['precip', 'temp']
+    dr_names (list): List of drought episode names
+    dr_years (dict): {drought: list} drought years per episode
+    ref_all3 (dict): {drought: list} reference years per episode
+    annual_medians (dict): {var: DataFrame} annual medians per variable
+    sites_all3 (dict): {var: {drought: DataFrame}} valid sites per var per episode
+    mk_trends (dict): {var: {'notrend','increasing','decreasing'}} MK filtered results
+    all_vars_qp (list): All variable names including runoff_efficiency and reservoirs
+    mk_types (list): List of MK trend types e.g. ['notrend','increasing','decreasing']
+    start_year (int): Start year for filtering (default: 1998)
+    end_year (int): End year for filtering (default: 2022)
+
+    Returns:
+    yearsbefore (dict): {drought: list} reference years before drought
+    yearsafter (dict): {drought: list} reference years after drought
+    prepost_rc (dict): {var: {drought: DataFrame}} pre-to-post relative change
+    prepost_rc_mk (dict): {var: {drought: {mk_type: DataFrame}}} relchange by MK trend
+    annual_medians (dict): filtered to study period
+    """
+    
+    #  Filter annual medians to study period 
+    for var in all_vars_qp:
+        annual_medians[var] = annual_medians[var].loc[start_year:end_year]
+        annual_medians[var] = annual_medians[var].dropna(how='all', axis=0)
+
+    # Split reference years into before/after drought
+    yearsbefore = {}
+    yearsafter  = {}
+
+    for dr in dr_names:
+        dryr1            = dr_years[dr][0]
+        dryr2            = dr_years[dr][-1]
+        yearsbefore[dr]  = [x for x in ref_all3[dr] if x < dryr1]
+        yearsafter[dr]   = [x for x in ref_all3[dr] if x > dryr2]
+
+    # Calculate pre-to-post relative change and filter by MK trend 
+    prepost_rc    = {var: {} for var in all_vars_qp}
+    prepost_rc_mk = {var: {dr: {} for dr in dr_names} for var in all_vars_qp}
+
+    for var in all_vars_qp:
+        print(var)
+        for dr in dr_names:
+            # Select correct sites depending on variable type
+            if var in var_names:
+                src = annual_medians[var][sites_all3[var][dr].columns.values]
+            
+            if var == 'runoff_efficiency':
+                src = annual_medians[var][sites_all3['RDC'][dr].columns.values]
+            else:
+                src = annual_medians[var]
+
+            pre  = src.loc[yearsbefore[dr]].median()
+            post = src.loc[yearsafter[dr]].median()
+            ref  = pre.replace(0, 1e-10)
+
+            prepost_rc[var][dr] = ((post - ref) / ref.abs() * 100).to_frame()
+
+            print(f"  {dr}")
+            for mk_type in mk_types:
+                shared_sites = prepost_rc[var][dr].index.intersection(
+                    mk_trends[var][mk_type].index
+                )
+                prepost_rc_mk[var][dr][mk_type] = prepost_rc[var][dr].loc[shared_sites]
+                n      = len(shared_sites)
+                median = (prepost_rc_mk[var][dr][mk_type].median().values[0]
+                          if n > 0 else float('nan'))
+                print(f"    {mk_type:12s} — sites: {n}, "
+                      f"Rel. Change Post from Pre drought: {median:.4f}")
+
+    return yearsbefore, yearsafter, prepost_rc, prepost_rc_mk, annual_medians
+
+    
+def calculate_ref_period_rel_change(all_vars_qp, dr_names, ann_MED, met_ann_MED,
+                                           annual_medians, ref_all3):
+    """
+    Calculate relative change between reference periods of different drought episodes,
+    using the first drought episode as the baseline.
+
+    Parameters:
+    all_vars_qp (list): All variable names including runoff_efficiency and reservoirs
+    dr_names (list): List of drought episode names, where dr_names[0] is the baseline
+    ann_MED (dict): {var: {drought: {'ref': DataFrame}}} annual median results for RDC/WT/SC
+    met_ann_MED (dict): {MET: {drought: {'ref': DataFrame}}} annual median results for MET vars
+    annual_medians (dict): {var: DataFrame} annual medians per variable
+    ref_all3 (dict): {drought: list} reference years per episode
+
+    Returns:
+    refMED_rc (dict): {var: {(dr_base, dr_comp): Series}} relative change between
+                      reference periods keyed by episode pair tuple
+    """
+    refMED_rc = {var: {} for var in all_vars_qp}
+    dr_base   = dr_names[0]
+
+    for var in all_vars_qp:
+        print(var)
+
+        for dr_comp in dr_names[1:]:
+
+            if var in ['RDC', 'WT', 'SC']:
+                shared_sites = ann_MED[var][dr_base]['ref'].index.intersection(
+                               ann_MED[var][dr_comp]['ref'].index)
+                print(f"  # sites in common {dr_base} and {dr_comp}: {len(shared_sites)}")
+
+                base = ann_MED[var][dr_base]['ref'].loc[shared_sites].replace(0, 1e-10)['REF']
+                comp = ann_MED[var][dr_comp]['ref'].loc[shared_sites]['REF']
+
+            elif var in ['precip', 'temp']:
+                base = met_ann_MED[var][dr_base]['ref'].replace(0, 1e-10)
+                comp = met_ann_MED[var][dr_comp]['ref']
+
+            elif var == 'runoff_efficiency':
+                RDC_sites = ann_MED['RDC'][dr_base]['ref'].index.intersection(ann_MED['RDC'][dr_comp]['ref'].index)
+                base = annual_medians[var].loc[ref_all3[dr_base]].median().replace(0, 1e-10)[RDC_sites].dropna(how='all')
+                comp = annual_medians[var].loc[ref_all3[dr_comp]].median()[RDC_sites].dropna(how='all')
+                shared_sites = base.index.intersection(comp.index)
+                print(f"  # sites in common {dr_base} and {dr_comp}: {len(shared_sites)}")
+                base = base[shared_sites]
+                comp = comp[shared_sites]
+            
+            elif var in ['reservoirs']:
+                base = annual_medians[var].loc[ref_all3[dr_base]].median().replace(0, 1e-10).dropna(how='all')
+                comp = annual_medians[var].loc[ref_all3[dr_comp]].median().dropna(how='all')
+                shared_sites = base.index.intersection(comp.index)
+                print(f"  # sites in common {dr_base} and {dr_comp}: {len(shared_sites)}")
+                base = base[shared_sites]
+                comp = comp[shared_sites]
+
+            refMED_rc[var][(dr_base, dr_comp)] = ((comp - base) / base) * 100
+            print(f"  Rel. change of {dr_comp} ref. from {dr_base} ref.: "
+                  f"{np.median(refMED_rc[var][(dr_base, dr_comp)]):.4f}")
+
+    return refMED_rc
+
+
+def calculate_pre_period_rel_change(all_vars_qp, dr_names, ann_MED, annual_medians, yearsbefore):
+    """
+    Calculate relative change between pre-drought periods of different drought episodes,
+    using the first drought episode as the baseline.
+
+    Parameters:
+    all_vars_qp (list): All variable names including runoff_efficiency and reservoirs
+    dr_names (list): List of drought episode names, where dr_names[0] is the baseline
+    ann_MED (dict): {var: {drought: {'ref': DataFrame}}} used to get shared sites for RDC/WT/SC
+    annual_medians (dict): {var: DataFrame} annual medians per variable
+    yearsbefore (dict): {drought: list} pre-drought years per episode
+
+    Returns:
+    preMED_rc (dict): {var: {(dr_base, dr_comp): Series}} relative change between
+                      pre-drought periods keyed by episode pair tuple
+    """
+    preMED_rc = {var: {} for var in all_vars_qp}
+    dr_base   = dr_names[0]
+
+    for var in all_vars_qp:
+        print(var)
+
+        for dr_comp in dr_names[1:]:
+
+            if var in ['RDC', 'WT', 'SC']:
+                shared_sites = ann_MED[var][dr_base]['ref'].index.intersection( ann_MED[var][dr_comp]['ref'].index)
+
+                base = annual_medians[var].loc[yearsbefore[dr_base], shared_sites].median().replace(0, 1e-10)
+                comp = annual_medians[var].loc[yearsbefore[dr_comp], shared_sites].median()
+
+            elif var in ['precip', 'temp']:
+                base = annual_medians[var].loc[yearsbefore[dr_base]].median().replace(0, 1e-10)
+                comp = annual_medians[var].loc[yearsbefore[dr_comp]].median()
+
+            elif var == 'runoff_efficiency':
+                RDC_sites = ann_MED['RDC'][dr_base]['ref'].index.intersection(ann_MED['RDC'][dr_comp]['ref'].index)
+
+                base = annual_medians[var].loc[yearsbefore[dr_base]].median().replace(0, 1e-10)[RDC_sites].dropna(how='all')
+                comp = annual_medians[var].loc[yearsbefore[dr_comp]].median()[RDC_sites].dropna(how='all')
+                shared_sites = base.index.intersection(comp.index)
+                print(f"  # sites in common {dr_base} and {dr_comp}: {len(shared_sites)}")
+                base = base[shared_sites]
+                comp = comp[shared_sites]
+            
+            elif var == 'reservoirs':
+                base = annual_medians[var].loc[yearsbefore[dr_base]].median().replace(0, 1e-10).dropna(how='all')
+                comp = annual_medians[var].loc[yearsbefore[dr_comp]].median().dropna(how='all')
+
+                shared_sites = base.index.intersection(comp.index)
+                base = base[shared_sites]
+                comp = comp[shared_sites]
+
+            preMED_rc[var][(dr_base, dr_comp)] = ((comp - base) / base) * 100
+            print(f"  Rel. change of {dr_comp} pre from {dr_base} pre: "
+                  f"{np.median(preMED_rc[var][(dr_base, dr_comp)]):.4f}")
+
+    return preMED_rc
+
+
+def get_var_onemonth_timeseries(var_all, month):
+    idx = pd.IndexSlice
+    var_month = var_all.groupby(level=['wyear', 'month']).median().loc[idx[:, month], :].groupby(level=['wyear']).median()
+    sorted_var_list = var_month.mean().sort_values(ascending=False).index.values
+    sorted_var_month = var_month[sorted_var_list]
+
+    # get the annual medians for WT sites to be plotted - SORTED BY the MONTH VALUES!!!!
+    sorted_var_ann = var_all.groupby(level=['wyear']).median()[sorted_var_list]
+    return (sorted_var_ann,sorted_var_month)
+
+
+def calc_values_RE(dr_names,ref_all3, dr_all3, dr_years, data, site_2_use, available):
+
+    ann_MED_RE = {var: {} for var in ['RE']}
+
+    for dr in dr_names:
+        ann_MED_RE['RE'][dr] = {}
+        df_ref = data[data.index.get_level_values('wyear').isin(ref_all3[dr])][site_2_use[dr].columns]
+        df_dr  = data[data.index.get_level_values('wyear').isin(dr_years[dr])][site_2_use[dr].columns]
+        (ann_MED_RE['RE'][dr]['relchange'],ann_MED_RE['RE'][dr]['drought'],ann_MED_RE['RE'][dr]['ref'],ann_MED_RE['RE'][dr]['diff'] ) = rel_change_median_annual(df_ref, df_dr, dr)
+
+    # Sites with data for each drought episode 
+    sites_all3_RE = {var: {} for var in ['RE']}
+
+    for num, var in enumerate(['RE']):
+        for drought in dr_names:
+            sites_all3_RE[var][drought] = data.copy()
+
+            for site in available.columns:
+                for year in dr_all3[drought]:
+                    if available.at[year, site] == 0:
+                        if site in sites_all3_RE['RE'][drought].columns.values:
+                            sites_all3_RE['RE'][drought].drop(site, axis=1, inplace=True)
+    avail_RE = {}
+    avail_RE['RE'] = available
+
+    return ann_MED_RE, sites_all3_RE, avail_RE

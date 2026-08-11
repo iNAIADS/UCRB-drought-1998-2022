@@ -79,7 +79,7 @@ def plot_importance_barchart(feat_imp_mean, feat_imp_se, spear_corr, filename, l
     sorted_idx = np.argsort(feat_imp_mean)
     pos = np.arange(sorted_idx.shape[0]) + 0.5
     fig = plt.figure(figsize=(20,12), facecolor='white')
-    ax = fig.add_axes((0.37, 0.1, 0.43, .85))
+    ax = fig.add_axes((0.35, 0.1, 0.45, .85))
     
     bars_to_plot = max_num_bars
     ax.barh(pos[-bars_to_plot:], feat_imp_mean[sorted_idx][-bars_to_plot:], align="center",
